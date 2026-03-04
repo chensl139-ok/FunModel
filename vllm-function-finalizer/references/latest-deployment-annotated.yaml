@@ -1,0 +1,567 @@
+# GPU 云函数部署模板（vLLM 通用注释版）
+# 使用方式：
+# 1) 先修改 mainContainer.image 为你的镜像。
+# 2) 再修改 MODEL_SOURCE_REF / MODEL_CACHE_DIR / SERVED_MODEL_NAME。
+# 3) 根据 GPU 显存调整 VLLM_MAX_MODEL_LEN / VLLM_MAX_NUM_SEQS / VLLM_MAX_NUM_BATCHED_TOKENS。
+# 4) 保持 autoscaler 并发目标 与 gateway.defaultConcurrencyLimit 一致。
+# 5) 如非 Qwen 模型，不要开启 Qwen 专用 parser/speculative 参数。
+
+entrypointService:
+  # 云函数服务名（建议与模型/用途相关）
+  name: vllm-service
+  # 固定 replicaSet 形态，便于在单 Pod 内管理主容器 + sidecar
+  serviceType: replicaSet
+  replicaSet:
+    pod:
+      mainContainer:
+        name: vllm
+        # Replace with your own runtime image.
+        # Suggested pattern: <registry>/<namespace>/vllm-openai:<tag>
+        image: your-registry/your-namespace/vllm-openai:your-tag
+        ports:
+          - containerPort: 8000
+            portName: http
+        command:
+          - /bin/bash
+          - '-c'
+          - |-
+            # 启动脚本：负责 vLLM 启动、健康等待、分阶段预热。
+            set -euo pipefail
+
+            echo ">>> Applying CUDA compatibility fix..."
+            rm -f /etc/ld.so.conf.d/*cuda-compat.conf || true
+            ldconfig || true
+
+            # --------- Base runtime knobs ---------
+            # vLLM 监听地址、并发和上下文上限；需结合显存调参。
+            : "${VLLM_HOST:=127.0.0.1}"
+            : "${VLLM_PORT:=8000}"
+            : "${VLLM_DTYPE:=auto}"
+            : "${VLLM_TENSOR_PARALLEL_SIZE:=1}"
+            : "${VLLM_GPU_MEMORY_UTILIZATION:=0.90}"
+            : "${VLLM_MAX_MODEL_LEN:=32768}"
+            : "${VLLM_MAX_NUM_SEQS:=32}"
+            : "${VLLM_MAX_NUM_BATCHED_TOKENS:=16384}"
+            : "${VLLM_DISABLE_LOG_REQUESTS:=true}"
+
+            # --------- Model source / cache strategy ---------
+            # 模型来源与缓存策略：
+            # - 有完整缓存时直接本地加载；
+            # - 缓存缺失时回退到远程仓库下载。
+            : "${VLLM_USE_MODELSCOPE:=True}"
+            : "${MODEL_DOWNLOAD_DIR:=/cache/modelscope}"
+            : "${MODEL_CACHE_DIR:=/cache/modelscope/models/your-org/your-model}"
+            : "${MODEL_SOURCE_REF:=your-org/your-model}"
+            : "${SERVED_MODEL_NAME:=your-org/your-model}"
+            : "${MODEL_CACHE_REQUIRED_FILES:=config.json,tokenizer.json,model.safetensors.index.json}"
+
+            export VLLM_USE_MODELSCOPE
+
+            CACHE_VALID=true
+            if [ -d "${MODEL_CACHE_DIR}" ]; then
+              IFS=',' read -r -a REQUIRED_FILES <<< "${MODEL_CACHE_REQUIRED_FILES}"
+              for f in "${REQUIRED_FILES[@]}"; do
+                f="$(echo "${f}" | xargs)"
+                [ -n "${f}" ] || continue
+                if [ ! -f "${MODEL_CACHE_DIR}/${f}" ]; then
+                  echo ">>> Missing ${f}, cache invalid"
+                  CACHE_VALID=false
+                  break
+                fi
+              done
+            else
+              CACHE_VALID=false
+            fi
+
+            MODEL_REF="${MODEL_SOURCE_REF}"
+            if [ "${CACHE_VALID}" = true ]; then
+              echo ">>> Valid cache found: ${MODEL_CACHE_DIR}"
+              MODEL_REF="${MODEL_CACHE_DIR}"
+            else
+              echo ">>> Cache unavailable, fallback to source: ${MODEL_SOURCE_REF}"
+            fi
+
+            # --------- Model-family-sensitive optional flags ---------
+            # 模型家族敏感参数：
+            # - qwen: 可自动带上 qwen3 parser/tool/speculative 默认值
+            # - generic/others: 默认不注入专用 parser，避免启动失败
+            : "${MODEL_FAMILY:=generic}"
+            : "${ENABLE_REASONING_PARSER:=false}"
+            : "${REASONING_PARSER:=}"
+            : "${ENABLE_TOOL_CALL_PARSER:=false}"
+            : "${TOOL_CALL_PARSER:=}"
+            : "${ENABLE_AUTO_TOOL_CHOICE:=false}"
+            : "${ENABLE_SPECULATIVE:=false}"
+            : "${SPECULATIVE_CONFIG_JSON:=}"
+
+            case "${MODEL_FAMILY}" in
+              qwen)
+                : "${REASONING_PARSER:=qwen3}"
+                : "${TOOL_CALL_PARSER:=qwen3_coder}"
+                : "${SPECULATIVE_CONFIG_JSON:={\"method\":\"qwen3_next_mtp\",\"num_speculative_tokens\":2}}"
+                : "${ENABLE_REASONING_PARSER:=true}"
+                : "${ENABLE_TOOL_CALL_PARSER:=true}"
+                : "${ENABLE_AUTO_TOOL_CHOICE:=true}"
+                ;;
+              *)
+                ;;
+            esac
+
+            CMD=(
+              vllm serve "${MODEL_REF}"
+              --host "${VLLM_HOST}"
+              --port "${VLLM_PORT}"
+              --dtype "${VLLM_DTYPE}"
+              --tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE}"
+              --download-dir "${MODEL_DOWNLOAD_DIR}"
+              --served-model-name "${SERVED_MODEL_NAME}"
+              --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}"
+              --max-model-len "${VLLM_MAX_MODEL_LEN}"
+              --max-num-seqs "${VLLM_MAX_NUM_SEQS}"
+              --max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS}"
+            )
+
+            if [ "${ENABLE_REASONING_PARSER}" = "true" ] && [ -n "${REASONING_PARSER}" ]; then
+              CMD+=(--reasoning-parser "${REASONING_PARSER}")
+            fi
+            if [ "${ENABLE_AUTO_TOOL_CHOICE}" = "true" ]; then
+              CMD+=(--enable-auto-tool-choice)
+            fi
+            if [ "${ENABLE_TOOL_CALL_PARSER}" = "true" ] && [ -n "${TOOL_CALL_PARSER}" ]; then
+              CMD+=(--tool-call-parser "${TOOL_CALL_PARSER}")
+            fi
+            if [ "${ENABLE_SPECULATIVE}" = "true" ] && [ -n "${SPECULATIVE_CONFIG_JSON}" ]; then
+              CMD+=(--speculative-config "${SPECULATIVE_CONFIG_JSON}")
+            fi
+            if [ "${VLLM_DISABLE_LOG_REQUESTS}" = "true" ]; then
+              CMD+=(--disable-log-requests)
+            fi
+
+            echo ">>> Starting vLLM"
+            "${CMD[@]}" &
+            VLLM_PID=$!
+
+            echo ">>> Waiting for /health"
+            HEALTHY=false
+            for i in $(seq 1 300); do
+              if curl -sf "http://${VLLM_HOST}:${VLLM_PORT}/health" >/dev/null 2>&1; then
+                echo ">>> vLLM healthy after ${i}s"
+                HEALTHY=true
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "${HEALTHY}" != true ]; then
+              echo ">>> vLLM failed to start within 300s"
+              exit 1
+            fi
+
+            echo ">>> Running staged warmup"
+            # 预热分 3 段：短非流式 -> 短流式 -> 中等上下文，降低首请求抖动。
+
+            # Stage 1: non-stream short request
+            python3 <<'PYEOF' || true
+            import json, os, urllib.request
+
+            model = os.environ.get("SERVED_MODEL_NAME", "your-org/your-model")
+            host = os.environ.get("VLLM_HOST", "127.0.0.1")
+            port = os.environ.get("VLLM_PORT", "8000")
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 64,
+                "temperature": 0.7,
+            }
+            req = urllib.request.Request(
+                f"http://{host}:{port}/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    print("Stage1 OK", r.status)
+            except Exception as e:
+                print("Stage1 warning", e)
+            PYEOF
+
+            # Stage 2: stream short request
+            python3 <<'PYEOF' || true
+            import json, os, urllib.request
+
+            model = os.environ.get("SERVED_MODEL_NAME", "your-org/your-model")
+            host = os.environ.get("VLLM_HOST", "127.0.0.1")
+            port = os.environ.get("VLLM_PORT", "8000")
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 64,
+                "stream": True,
+            }
+            req = urllib.request.Request(
+                f"http://{host}:{port}/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    chunks = 0
+                    while True:
+                        line = r.readline()
+                        if not line or line.strip() == b"data: [DONE]":
+                            break
+                        chunks += 1
+                    print("Stage2 OK", chunks)
+            except Exception as e:
+                print("Stage2 warning", e)
+            PYEOF
+
+            # Stage 3: medium context request
+            python3 <<'PYEOF' || true
+            import json, os, urllib.request, time
+
+            model = os.environ.get("SERVED_MODEL_NAME", "your-org/your-model")
+            host = os.environ.get("VLLM_HOST", "127.0.0.1")
+            port = os.environ.get("VLLM_PORT", "8000")
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "warmup " * 200},
+                ],
+                "max_tokens": 256,
+                "temperature": 0.7,
+            }
+            req = urllib.request.Request(
+                f"http://{host}:{port}/v1/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                t0 = time.time()
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    _ = r.read()
+                print("Stage3 OK", round(time.time() - t0, 2), "s")
+            except Exception as e:
+                print("Stage3 warning", e)
+            PYEOF
+
+            echo ">>> Warmup completed"
+            wait "${VLLM_PID}"
+        env:
+          # 基础运行环境变量
+          - name: VLLM_LOGGING_LEVEL
+            value: INFO
+          - name: VLLM_USE_MODELSCOPE
+            value: 'True'
+          - name: MODELSCOPE_CACHE
+            value: /cache/modelscope
+          - name: CUDA_DEVICE_MAX_CONNECTIONS
+            value: '1'
+          - name: PYTORCH_CUDA_ALLOC_CONF
+            value: expandable_segments:True
+
+          # --- Generic model/runtime knobs (edit as needed) ---
+          # 必改项：模型来源、缓存目录、服务名
+          - name: MODEL_FAMILY
+            value: generic
+          - name: MODEL_SOURCE_REF
+            value: your-org/your-model
+          - name: MODEL_CACHE_DIR
+            value: /cache/modelscope/models/your-org/your-model
+          - name: SERVED_MODEL_NAME
+            value: your-org/your-model
+          - name: MODEL_DOWNLOAD_DIR
+            value: /cache/modelscope
+          - name: MODEL_CACHE_REQUIRED_FILES
+            value: config.json,tokenizer.json,model.safetensors.index.json
+
+          # 常用性能参数：显存不足优先下调 SEQS/BATCHED_TOKENS
+          - name: VLLM_HOST
+            value: 127.0.0.1
+          - name: VLLM_PORT
+            value: '8000'
+          - name: VLLM_DTYPE
+            value: auto
+          - name: VLLM_TENSOR_PARALLEL_SIZE
+            value: '1'
+          - name: VLLM_GPU_MEMORY_UTILIZATION
+            value: '0.90'
+          - name: VLLM_MAX_MODEL_LEN
+            value: '32768'
+          - name: VLLM_MAX_NUM_SEQS
+            value: '32'
+          - name: VLLM_MAX_NUM_BATCHED_TOKENS
+            value: '16384'
+          - name: VLLM_DISABLE_LOG_REQUESTS
+            value: 'true'
+
+          # --- Optional parser flags ---
+          # 可选解析器参数：仅当模型与镜像确认支持时再开启
+          - name: ENABLE_REASONING_PARSER
+            value: 'false'
+          - name: REASONING_PARSER
+            value: ''
+          - name: ENABLE_AUTO_TOOL_CHOICE
+            value: 'false'
+          - name: ENABLE_TOOL_CALL_PARSER
+            value: 'false'
+          - name: TOOL_CALL_PARSER
+            value: ''
+          - name: ENABLE_SPECULATIVE
+            value: 'false'
+          - name: SPECULATIVE_CONFIG_JSON
+            value: ''
+        livenessProbe:
+          set: false
+        readinessProbe:
+          set: true
+          httpGet:
+            path: /health
+            port: 8001
+          # 注意：这里探针走 8001(sidecar) 是为了走与网关一致的链路
+          initialDelaySeconds: 180
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 12
+        startupProbe:
+          set: false
+      sidecarContainers:
+        # sidecar 负责 OpenAI 兼容路由、流式透传和可选字段映射
+        - name: protocol-adapter
+          image: hub.6scloud.com/d1r7umcsfi9c73b4drdg/python:3.10-slim
+          ports:
+            - containerPort: 8001
+              portName: proxy-api
+          command:
+            - /bin/bash
+            - '-c'
+            - |-
+              set -e
+
+              pip install fastapi uvicorn httpx --no-cache-dir -q
+
+              cat > /tmp/proxy.py <<'PYEOF'
+              import json
+              import os
+              import httpx
+              import uvicorn
+              from fastapi import FastAPI, Request
+              from fastapi.responses import Response, StreamingResponse
+
+              app = FastAPI()
+              VLLM_URL = os.getenv("TARGET_BASE_URL", "http://127.0.0.1:8000")
+              DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "your-org/your-model")
+
+              def map_reasoning_fields(obj):
+                  if isinstance(obj, dict):
+                      out = {}
+                      for k, v in obj.items():
+                          if k == "reasoning":
+                              out["reasoning_content"] = map_reasoning_fields(v)
+                          else:
+                              out[k] = map_reasoning_fields(v)
+                      return out
+                  if isinstance(obj, list):
+                      return [map_reasoning_fields(x) for x in obj]
+                  return obj
+
+              async def forward_stream(resp: httpx.Response, enable_reasoning_mapping: bool):
+                  buffer = b""
+                  async for chunk in resp.aiter_bytes():
+                      buffer += chunk
+                      while b"\n" in buffer:
+                          line, buffer = buffer.split(b"\n", 1)
+                          line = line.rstrip(b"\r")
+                          if enable_reasoning_mapping and line.startswith(b"data: ") and line != b"data: [DONE]":
+                              try:
+                                  payload = json.loads(line[6:])
+                                  payload = map_reasoning_fields(payload)
+                                  yield b"data: " + json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
+                              except Exception:
+                                  yield line + b"\n"
+                          else:
+                              yield line + b"\n"
+                  if buffer:
+                      yield buffer
+
+              async def handle_chat_like(request: Request, target_path: str):
+                  force_stream_usage = os.getenv("FORCE_STREAM_USAGE", "true").lower() == "true"
+                  enable_reasoning_mapping = os.getenv("ENABLE_REASONING_MAPPING", "false").lower() == "true"
+
+                  body = await request.body()
+                  is_stream = False
+
+                  if body:
+                      try:
+                          data = json.loads(body)
+                          if isinstance(data, dict):
+                              data.setdefault("model", DEFAULT_MODEL)
+                              is_stream = bool(data.get("stream", False))
+                              if force_stream_usage and is_stream:
+                                  data.setdefault("stream_options", {})
+                                  data["stream_options"]["include_usage"] = True
+                              body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                      except Exception:
+                          pass
+
+                  headers = {
+                      k: v
+                      for k, v in request.headers.items()
+                      if k.lower() not in ("host", "content-length", "connection", "transfer-encoding")
+                  }
+
+                  client = httpx.AsyncClient(base_url=VLLM_URL, timeout=None)
+                  try:
+                      req = client.build_request("POST", target_path, content=body, headers=headers)
+                      resp = await client.send(req, stream=True)
+                  except Exception as e:
+                      await client.aclose()
+                      return Response(content=f"Proxy Error: {e}", status_code=502)
+
+                  if is_stream:
+                      async def stream_wrapper():
+                          try:
+                              async for item in forward_stream(resp, enable_reasoning_mapping):
+                                  yield item
+                          finally:
+                              await resp.aclose()
+                              await client.aclose()
+
+                      return StreamingResponse(
+                          stream_wrapper(),
+                          status_code=resp.status_code,
+                          media_type=resp.headers.get("content-type", "text/event-stream"),
+                      )
+
+                  try:
+                      content = await resp.aread()
+                  finally:
+                      await resp.aclose()
+                      await client.aclose()
+
+                  if enable_reasoning_mapping and resp.status_code == 200 and "application/json" in resp.headers.get("content-type", ""):
+                      try:
+                          payload = json.loads(content)
+                          payload = map_reasoning_fields(payload)
+                          content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                      except Exception:
+                          pass
+
+                  return Response(
+                      content=content,
+                      status_code=resp.status_code,
+                      media_type=resp.headers.get("content-type"),
+                  )
+
+              @app.get("/health")
+              async def health():
+                  async with httpx.AsyncClient(base_url=VLLM_URL, timeout=3.0) as client:
+                      try:
+                          r = await client.get("/health")
+                          return Response(content=r.content, status_code=r.status_code)
+                      except Exception:
+                          return Response(content=b"Main container not ready", status_code=503)
+
+              @app.post("/v1/chat/completions")
+              async def chat(request: Request):
+                  return await handle_chat_like(request, "/v1/chat/completions")
+
+              @app.post("/v1/completions")
+              async def completion(request: Request):
+                  return await handle_chat_like(request, "/v1/completions")
+
+              @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+              async def proxy(path: str, request: Request):
+                  if request.method == "OPTIONS":
+                      return Response(status_code=204)
+                  body = await request.body()
+                  headers = {
+                      k: v
+                      for k, v in request.headers.items()
+                      if k.lower() not in ("host", "content-length", "connection")
+                  }
+                  url = f"/{path}"
+                  if request.url.query:
+                      url = f"{url}?{request.url.query}"
+                  async with httpx.AsyncClient(base_url=VLLM_URL, timeout=None) as client:
+                      try:
+                          r = await client.request(request.method, url, content=body, headers=headers)
+                          return Response(content=r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
+                      except Exception as e:
+                          return Response(content=f"Proxy Error: {e}", status_code=502)
+
+              if __name__ == "__main__":
+                  uvicorn.run(app, host="0.0.0.0", port=8001, timeout_graceful_shutdown=25)
+              PYEOF
+
+              exec python /tmp/proxy.py
+          env:
+            - name: TARGET_BASE_URL
+              value: http://127.0.0.1:8000
+            # sidecar 转发默认模型名（与 SERVED_MODEL_NAME 保持一致）
+            - name: DEFAULT_MODEL
+              value: your-org/your-model
+            - name: ENABLE_REASONING_MAPPING
+              value: 'false'
+            # 开启后，流式请求自动补 include_usage
+            - name: FORCE_STREAM_USAGE
+              value: 'true'
+          livenessProbe:
+            set: false
+          readinessProbe:
+            set: true
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          startupProbe:
+            set: false
+      terminationGracePeriodSeconds: 180
+      recommendInstanceTypes:
+        - nvidia.rtx4090.g1.amd64
+        - nvidia.rtx5090.g1.amd64
+    autoScaler:
+      # 自动扩缩容建议：
+      # - ScaleUp 快速放大
+      # - ScaleDown 缓慢回收，减少抖动
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 10
+          policy:
+            type: Percent
+            value: 100
+            periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policy:
+            type: Percent
+            value: 10
+            periodSeconds: 60
+      metrics:
+        # 并发目标：务必与 gateway.defaultConcurrencyLimit 同步
+        - type: Function
+          metric:
+            name: Concurrency
+            target:
+              value: 32
+              type: Gauge
+      minReplicas: 1
+      maxReplicas: 10
+    resources:
+      requests:
+        nvidia.com/gpu: 1
+      limits:
+        nvidia.com/gpu: 1
+gateway:
+  # 网关入口走 sidecar，统一健康检查与协议适配路径
+  entrypointPort: 8001
+  # 与 autoscaler.metrics[].metric.target.value 保持一致
+  defaultConcurrencyLimit: 32
+  workloadType: OpenAICompatibleChat

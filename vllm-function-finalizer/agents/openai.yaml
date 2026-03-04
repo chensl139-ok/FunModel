@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM Function Finalizer"
+  short_description: "按生产规范优化 SiliconFlow vLLM 部署 YAML。"
+  default_prompt: "Use $vllm-function-finalizer to finalize my SiliconFlow vLLM function YAML with cache checks, staged warmup, sidecar routing, and consistent probe/concurrency wiring across model families."

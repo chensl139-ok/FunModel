@@ -1,0 +1,1253 @@
+description:
+  zh-cn: |
+    当前模板用于创建一个完全自定义的 GPU 云函数
+
+    > 合法的 GPU 云函数至少应包括入口服务和网关配置两部分
+    > 
+    > 查看[GPU 云函数概述](https://siliconflow.feishu.cn/wiki/J9wMwkfmIixvJbk5SjvcxlprnXc?from=from_copylink)了解更多
+  en-us: Create a fully customized GPU Function definition for deployment.
+type: object
+required:
+  - gateway
+  - entrypointService
+properties:
+  entrypointService:
+    title:
+      zh-cn: 入口服务
+      en-us: Entrypoint Service
+    description:
+      zh-cn: 用户请求云函数端点，请求将被网关转发至入口服务
+      en-us: |-
+        The Function Gateway forwards incoming requests to this entrypoint
+        service.
+    $ref: '#/definitions/service'
+  additionalServices:
+    title:
+      zh-cn: 附加服务（多个）
+      en-us: Additional Services
+    description:
+      zh-cn: |-
+        * 附加服务无法直接接受请求，需要被入口服务调用
+        * 不同服务可以独立扩缩容
+      en-us: |-
+        * Additional services do not receive external traffic directly; they
+        must be invoked by the entrypoint service.
+
+        * Each service can scale independently.
+    type: array
+    items:
+      $ref: '#/definitions/service'
+  gateway:
+    title:
+      zh-cn: 网关配置
+      en-us: Gateway
+    type: object
+    required:
+      - entrypointPort
+      - defaultConcurrencyLimit
+    properties:
+      entrypointPort:
+        title:
+          zh-cn: 入口端口号
+          en-us: Entry Port
+        description:
+          zh-cn: |-
+            * 应为入口服务容器的 Http 端口之一
+            * 网关拉取请求到部署，将请求转发到入口服务中的指定端口
+          en-us: |-
+            * Must be one of the HTTP ports exposed by the entrypoint service
+            container.
+
+            * The Gateway pulls requests into the deployment and forwards them
+            to the specified port in the entrypoint service.
+        type: integer
+        maximum: 65535
+        minimum: 1
+        multipleOf: 1
+        format: formdata-selector
+        script: |-
+
+          console.log('Entrypoint Port Script Input:', formdata);
+
+          if (formdata && formdata.entrypointService) {
+            const portMap = new Map();
+            const serviceType = formdata.entrypointService.serviceType;
+
+            // 辅助函数：收集端口
+            const collectPorts = (ports) => {
+              if (!Array.isArray(ports)) return;
+              ports.forEach(p => {
+                if (p && typeof p.containerPort === 'number') {
+                  // 使用 "端口号" 作为唯一键去重 (如果需要区分协议可加上协议)
+                  // 这里保留端口名以便展示，但 Key 只用端口号，防止同端口不同名重复出现
+                  const key = p.containerPort; 
+                  // 如果 map 里还没有这个端口，或者当前这个有名字而之前的没名字，则更新
+                  if (!portMap.has(key) || (p.portName && !portMap.get(key).portName)) {
+                      portMap.set(key, p);
+                  }
+                }
+              });
+            };
+
+            // 辅助函数：处理 Sidecar 数组 (增加空值保护)
+            const collectSidecarPorts = (sidecars) => {
+              if (!Array.isArray(sidecars)) return;
+              sidecars.forEach(sc => collectPorts(sc?.ports));
+            };
+
+            // --- 分支逻辑 (修正大小写匹配) ---
+
+            // 场景 A: ReplicaSet (兼容 'replicaSet' 和 'ReplicaSet')
+            if (serviceType === 'replicaSet' || serviceType === 'ReplicaSet') {
+              // 注意：这里取数据要用 JSON 中实际存在的 key，通常是小写开头
+              const rs = formdata.entrypointService.replicaSet; 
+              if (rs && rs.pod) {
+                collectPorts(rs.pod.mainContainer?.ports);
+                collectSidecarPorts(rs.pod.sidecarContainers);
+              }
+            } 
+            
+            // 场景 B: LeaderWorkerSet (兼容 'leaderWorkerSet' 和 'LeaderWorkerSet')
+            else if (serviceType === 'leaderWorkerSet' || serviceType === 'LeaderWorkerSet') {
+              const lws = formdata.entrypointService.leaderWorkerSet;
+              if (lws) {
+                // 1. 收集 Leader
+                if (lws.leader) {
+                  collectPorts(lws.leader.mainContainer?.ports);
+                  collectSidecarPorts(lws.leader.sidecarContainers);
+                }
+
+                // 2. 收集 Worker
+                if (lws.worker) {
+                  collectPorts(lws.worker.mainContainer?.ports);
+                  collectSidecarPorts(lws.worker.sidecarContainers);
+                }
+              }
+            }
+
+            // 场景 C: statefulSet (兼容 'statefulSet' 和 'StatefulSet')
+            if (serviceType === 'statefulSet' || serviceType === 'StatefulSet') {
+              // 注意：这里取数据要用 JSON 中实际存在的 key，通常是小写开头
+              const ss = formdata.entrypointService.statefulSet; 
+              if (ss && ss.pod) {
+                collectPorts(ss.pod.mainContainer?.ports);
+                collectSidecarPorts(ss.pod.sidecarContainers);
+              }
+            } 
+            
+            // --- 结果格式化 ---
+            // 将 Map 转回数组并排序，方便用户查找
+            return Array.from(portMap.values())
+              .sort((a, b) => a.containerPort - b.containerPort)
+              .map(p => ({
+                label: String(p.containerPort) + (p.portName ? ` (${p.portName})` : ''),
+                value: p.containerPort
+              }));
+          }
+
+          return [];
+      defaultConcurrencyLimit:
+        title:
+          zh-cn: 默认最大并发数
+          en-us: Default Concurrency Limit
+        description:
+          zh-cn: |-
+            * 此设置项为实际部署时最大并发数的默认值，实际最大并发数以部署时配置为准
+            * 最大并发数控制网关的请求拉取行为，任一时刻，入口服务单个副本同时处理的请求数量的最大值
+          en-us: |-
+            * Default upper bound of concurrent requests per instance used at
+            deploy time. The effective limit is determined by the deployment
+            configuration.
+
+            * Controls Gateway request pulling: the maximum number of requests
+            handled simultaneously by one entrypoint service instance.
+        default: 1
+        type: integer
+        minimum: 1
+        multipleOf: 1
+      workloadType:
+        type: string
+        title:
+          zh-cn: 请求场景类型
+          en-us: Workload Type
+        description:
+          zh-cn: |-
+            对于 OpenAI 兼容的对话模型（兼容 /chat/completions 接口），选择对应场景类型，网关会自动获取
+            TTFT、TPOT、TokenRate 等指标，可配合用于自动扩缩容等
+          en-us: |-
+            For OpenAI compatible chat models (compatible with the
+            /chat/completions endpoint), select the corresponding workload type.
+            The gateway will automatically obtain metrics such as TTFT, TPOT,
+            and TokenRate, which can be used for autoscaling.
+        default: general
+        oneOf:
+          - const: general
+            title:
+              zh-cn: 非特定场景
+              en-us: General
+          - const: OpenAICompatibleChat
+            title:
+              zh-cn: OpenAI 兼容的对话模型
+              en-us: OpenAI Compatible Chat
+definitions:
+  service:
+    type: object
+    required:
+      - name
+      - serviceType
+    properties:
+      name:
+        $ref: '#/definitions/serviceName'
+      serviceType:
+        title:
+          zh-cn: 服务类型
+          en-us: Service Type
+        type: string
+        default: replicaSet
+        oneOf:
+          - const: replicaSet
+            title:
+              zh-cn: 无状态副本服务（replicaSet）
+              en-us: Standard Service (replicaSet)
+          - const: leaderWorkerSet
+            title:
+              zh-cn: 多机副本服务（leaderWorkerSet）
+              en-us: Leader Worker Set
+          - const: statefulSet
+            title:
+              zh-cn: 有状态副本服务（statefulSet）
+              en-us: Stateful Set
+    allOf:
+      - if:
+          required:
+            - serviceType
+          properties:
+            serviceType:
+              const: replicaSet
+        then:
+          required:
+            - replicaSet
+          properties:
+            replicaSet:
+              $ref: '#/definitions/replicaSet'
+      - if:
+          required:
+            - serviceType
+          properties:
+            serviceType:
+              const: leaderWorkerSet
+        then:
+          required:
+            - leaderWorkerSet
+          properties:
+            leaderWorkerSet:
+              $ref: '#/definitions/leaderWorkerSet'
+      - if:
+          required:
+            - serviceType
+          properties:
+            serviceType:
+              const: statefulSet
+        then:
+          required:
+            - statefulSet
+          properties:
+            statefulSet:
+              $ref: '#/definitions/statefulSet'
+  serviceName:
+    title:
+      zh-cn: 服务名称
+      en-us: Service Name
+    description:
+      zh-cn: |-
+        * 实际部署时，与部署 ID 共同构成 K8s 中的 Service Name
+        * 同一个区域、同一个组织内，可以使用 Service Name 完成内网 Http 请求
+        - 只能使用小写字母、数字与连接符 -
+        - 必须以字母或数字开头和结尾
+        - 长度 1 ～ 32 个字符
+      en-us: |-
+        * Combined with the deployment ID, this composes the Kubernetes Service
+        name at deployment.
+
+        * Within the same region and organization, services can be reached over
+        the internal network by this Service name.
+
+        - Allowed: lowercase letters, digits, and hyphen (-)
+
+        - Must start and end with an alphanumeric character
+
+        - Length: 1--32 characters
+    type: string
+    minLength: 1
+    maxLength: 32
+    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+  replicaSet:
+    title:
+      zh-cn: 无状态副本服务（replicaSet）
+      en-us: Standard Replica Set
+    description:
+      zh-cn: |-
+        > 无状态副本服务适用于**大多数 AI 推理服务**或无状态应用的部署与运行；
+        >
+        > 每个副本对应一个实例（Pod），由 Deployment 进行生命周期管理，并通过 HPA（Horizontal Pod Autoscaler）进行**水平自动扩缩容**，通过 Service 提供**稳定的内网访问入口**
+      en-us: |-
+        > Replica Set service is suitable for **most AI inference workloads** and stateless applications
+        >
+        > Each replica corresponds to one instance (Pod), managed by a Deployment for its lifecycle, with **horizontal autoscaling** powered by HPA (Horizontal Pod Autoscaler), and internal traffic exposed via a stable Service endpoint
+    type: object
+    required:
+      - pod
+    properties:
+      pod:
+        $ref: '#/definitions/pod'
+      autoScaler:
+        $ref: '#/definitions/autoScaler'
+  leaderWorkerSet:
+    title:
+      zh-cn: 多机副本服务（leaderWorkerSet）
+      en-us: Leader Worker Set
+    description:
+      zh-cn: |
+        > 主从协同服务适用于**单个推理任务需要多台物理机/多实例协同计算**的场景；
+        >
+        > 一个副本对应一个 Leader-Worker 组（LWS Group），包含 1 个 Leader 实例（Pod）和若干个 Worker 实例；
+        >
+        > 通过配置 `副本实例数量（size）` 和 `实例暴露索引（exposeWorkerIndices）` 等参数，控制每个组内的 Worker 实例数量以及是否对外暴露某些 Worker，用于更灵活的集群拓扑设计
+        > 
+        > 建议部署时不小于 2 副本
+        > 建议副本数不小于 2
+        > 
+        > 有序启动、退出，后一个副本需要在前一个副本就绪之后才会启动
+        > 
+        > 更新时从后序副本开始逐个向前更新
+      en-us: |
+        > Leader-Worker Set service is designed for scenarios where **a single logical inference job needs multiple machines/instances to collaborate**
+        >
+        > Each replica corresponds to one Leader-Worker group (LWS Group), consisting of 1 leader instance (Pod) and several worker instances
+        >
+        > Parameters like `size` and `exposeWorkerIndices` let you control the number of workers per group and whether specific workers are exposed externally, enabling flexible cluster topologies.
+    type: object
+    required:
+      - size
+      - exposeWorkerIndices
+      - leader
+      - worker
+    properties:
+      size:
+        title:
+          zh-cn: 副本实例数量（包含 Leader）
+          en-us: Size
+        type: integer
+        minimum: 2
+        default: 2
+      exposeWorkerIndices:
+        title:
+          zh-cn: 暴露实例索引
+          en-us: Expose Work Indices
+        description:
+          zh-cn: |-
+            * `-1` 表示 Leader 及所有 Worker
+            * 具体数字表示实例在副本中的索引值，其中 `0` 固定为 Leader
+            * 同时添加 `-1` 和其他数字，按 Leader 及所有 Worker 都暴露生效
+        type: array
+        minItems: 1
+        default:
+          - -1
+        items:
+          type: integer
+          default: -1
+      leader:
+        title:
+          zh-cn: Leader 实例
+          en-us: Leader
+        $ref: '#/definitions/pod'
+      worker:
+        title:
+          zh-cn: Worker 实例
+          en-us: Worker
+        $ref: '#/definitions/pod'
+      autoScaler:
+        $ref: '#/definitions/autoScaler'
+  statefulSet:
+    type: object
+    required:
+      - pod
+    title:
+      zh-cn: 有状态副本服务
+      en-us: Stateful Set
+    description:
+      zh-cn: |
+        > 适用于数据库、缓存、中间件服务
+        > 
+        > 建议副本数不小于 2
+        > 
+        > 有序启动、退出，后一个副本需要在前一个副本就绪之后才会启动
+        > 
+        > 更新时从后序副本开始逐个向前更新
+      en-us: '> Intended for **databases, caches, and middleware**'
+    properties:
+      pod:
+        $ref: '#/definitions/pod'
+      autoScaler:
+        $ref: '#/definitions/autoScaler'
+  autoScaler:
+    title:
+      zh-cn: 自动扩缩容
+      en-us: Auto Scaler
+    type: object
+    properties:
+      behavior:
+        title:
+          zh-cn: 扩缩容行为
+          en-us: Behavior
+        type: object
+        properties:
+          scaleUp:
+            title:
+              zh-cn: 扩容时
+              en-us: Scale Up
+            allOf:
+              - $ref: '#/definitions/scalingBehavior'
+            properties:
+              stabilizationWindowSeconds:
+                default: 10
+          scaleDown:
+            title:
+              zh-cn: 缩容时
+              en-us: Scale Down
+            allOf:
+              - $ref: '#/definitions/scalingBehavior'
+            properties:
+              stabilizationWindowSeconds:
+                default: 300
+      metrics:
+        title:
+          zh-cn: 扩缩容指标
+          en-us: Metrics
+        description:
+          zh-cn: 配置指标及对应目标值
+          en-us: |-
+            Configure scaling metrics and target values. Mirrors the template
+            structure.
+        type: array
+        default:
+          - type: Function
+            metric:
+              name: QPS
+              target:
+                value: 1
+                type: CounterRate
+        items:
+          type: object
+          required:
+            - type
+            - metric
+          properties:
+            type:
+              title:
+                zh-cn: 指标类型
+                en-us: Metric Type
+              type: string
+              default: Function
+              oneOf:
+                - const: Function
+                  title:
+                    zh-cn: 云函数内置指标
+                    en-us: Function (Built-in)
+                - const: Custom
+                  title:
+                    zh-cn: 自定义指标
+                    en-us: Custom
+            metric:
+              title:
+                zh-cn: 指标定义
+                en-us: Metric
+              type: object
+              required:
+                - name
+                - target
+              properties:
+                name:
+                  title:
+                    zh-cn: 指标名
+                    en-us: Metric Name
+                  type: string
+                  default: QPS
+                target:
+                  title:
+                    zh-cn: 目标
+                    en-us: Target
+                  type: object
+                  required:
+                    - value
+                  properties:
+                    value:
+                      title:
+                        zh-cn: 目标值
+                        en-us: Target Value
+                      type: number
+                      default: 1
+                    type:
+                      title:
+                        zh-cn: 目标值类型
+                        en-us: Target Type
+                      type: string
+                      default: Gauge
+                      oneOf:
+                        - const: Gauge
+                          title:
+                            zh-cn: 瞬时值
+                            en-us: Gauge (instant value)
+                        - const: CounterRate
+                          title:
+                            zh-cn: 变化率
+                            en-us: Counter Rate
+                        - const: HistogramRateP99
+                          title:
+                            zh-cn: 统计变化率的 99% 分位值
+                            en-us: Histogram Rate P99
+                        - const: HistogramRateP90
+                          title:
+                            zh-cn: 统计变化率的 90% 分位值
+                            en-us: Histogram Rate P90
+                        - const: HistogramRateP75
+                          title:
+                            zh-cn: 统计变化率的 75% 分位值
+                            en-us: Histogram Rate P75
+                        - const: HistogramRateP50
+                          title:
+                            zh-cn: 统计变化率的 50% 分位值
+                            en-us: Histogram Rate P50
+                        - const: HistogramSumRate
+                          title:
+                            zh-cn: 汇总统计变化率
+                            en-us: Histogram Sum Rate
+          allOf:
+            - if:
+                properties:
+                  type:
+                    const: Function
+              then:
+                properties:
+                  metric:
+                    properties:
+                      name:
+                        type: string
+                        default: QPS
+                        oneOf:
+                          - const: QPS
+                            title:
+                              zh-cn: 每秒请求数（QPS）
+                              en-us: QPS
+                          - const: Concurrency
+                            title:
+                              zh-cn: 并发数
+                              en-us: Concurrency
+                          - const: QueueWaitingTime
+                            title:
+                              zh-cn: 请求队列等待时长（s）
+                              en-us: Queue Waiting Time (s)
+                          - const: GPUUtilization
+                            title:
+                              zh-cn: GPU 利用率
+                              en-us: GPU Utilization
+                          - const: GPUPowerDraw
+                            title:
+                              zh-cn: GPU 功率
+                              en-us: GPU Power Draw
+                          - const: CPUUtilization
+                            title:
+                              zh-cn: CPU 利用率
+                              en-us: CPU Utilization
+                          - const: TPOT
+                            title:
+                              zh-cn: Token 间延迟（s）
+                              en-us: TPOT (s)
+                          - const: TTFT
+                            title:
+                              zh-cn: 首 token 延迟（s）
+                              en-us: TTFT (s)
+                          - const: TokenRate
+                            title:
+                              zh-cn: 输出 token 速率（TPS）
+                              en-us: Completion tokens per second
+                      target:
+                        required:
+                          - value
+                          - type
+            - if:
+                properties:
+                  type:
+                    const: Function
+                  metric:
+                    properties:
+                      name:
+                        const: QPS
+              then:
+                properties:
+                  metric:
+                    properties:
+                      target:
+                        properties:
+                          type:
+                            default: CounterRate
+                            oneOf:
+                              - const: CounterRate
+                                title:
+                                  zh-cn: 变化率
+                                  en-us: Counter Rate
+            - if:
+                properties:
+                  type:
+                    const: Function
+                  metric:
+                    properties:
+                      name:
+                        enum:
+                          - Concurrency
+                          - GPUUtilization
+                          - GPUPowerDraw
+                          - CPUUtilization
+              then:
+                properties:
+                  metric:
+                    properties:
+                      target:
+                        properties:
+                          type:
+                            default: Gauge
+                            oneOf:
+                              - const: Gauge
+                                title:
+                                  zh-cn: 瞬时值
+                                  en-us: Gauge (instant value)
+            - if:
+                properties:
+                  type:
+                    const: Function
+                  metric:
+                    properties:
+                      name:
+                        enum:
+                          - QueueWaitingTime
+                          - TPOT
+                          - TTFT
+                          - TokenRate
+              then:
+                properties:
+                  metric:
+                    properties:
+                      target:
+                        properties:
+                          type:
+                            default: HistogramSumRate
+                            oneOf:
+                              - const: HistogramRateP50
+                                title:
+                                  zh-cn: 统计变化率的 50% 分位值
+                                  en-us: Histogram Rate P50
+                              - const: HistogramRateP75
+                                title:
+                                  zh-cn: 统计变化率的 75% 分位值
+                                  en-us: Histogram Rate P75
+                              - const: HistogramRateP90
+                                title:
+                                  zh-cn: 统计变化率的 90% 分位值
+                                  en-us: Histogram Rate P90
+                              - const: HistogramRateP99
+                                title:
+                                  zh-cn: 统计变化率的 99% 分位值
+                                  en-us: Histogram Rate P99
+                              - const: HistogramSumRate
+                                title:
+                                  zh-cn: 统计变化率
+                                  en-us: Histogram Rate
+            - if:
+                properties:
+                  type:
+                    const: Custom
+              then:
+                properties:
+                  metric:
+                    properties:
+                      name:
+                        type: string
+                        default: tpot
+                      target:
+                        required:
+                          - value
+                          - type
+  scalingBehavior:
+    type: object
+    properties:
+      stabilizationWindowSeconds:
+        title:
+          zh-cn: 稳定窗口（s）
+          en-us: Stabilization Window (s)
+        type: integer
+        minimum: 1
+        multipleOf: 1
+      policies:
+        title:
+          zh-cn: 扩 / 缩容执行策略
+          en-us: Policies
+        description:
+          zh-cn: |-
+            * 扩容时，按照多个策略的最大值执行
+            * 缩容时，按照多个策略的最小值执行
+            * 若不配置任何策略，系统默认策略为当前副本数的 100%
+          en-us: |-
+            * During scale up, the maximum value among policies is applied.
+
+            * During scale down, the minimum value among policies is applied.
+
+            * If no policies are configured, the system uses a default of 100%
+            of current replicas.
+        type: array
+        items:
+          type: object
+          required:
+            - type
+            - value
+            - periodSeconds
+          properties:
+            type:
+              title:
+                zh-cn: 策略类型
+                en-us: Policy Type
+              type: string
+              default: Percent
+              oneOf:
+                - const: Pods
+                  title:
+                    zh-cn: 固定副本数
+                    en-us: Pods
+                - const: Percent
+                  title:
+                    zh-cn: 百分比
+                    en-us: Percent
+            value:
+              title:
+                zh-cn: 限制值
+                en-us: Limit Value
+              type: integer
+              minimum: 1
+              default: 100
+            periodSeconds:
+              title:
+                zh-cn: 评估周期（s）
+                en-us: Evaluation Period (s)
+              type: integer
+              minimum: 1
+              default: 15
+  pod:
+    title:
+      zh-cn: 实例详细配置
+      en-us: Pod Definition
+    type: object
+    required:
+      - mainContainer
+      - recommendInstanceTypes
+    properties:
+      mainContainer:
+        title:
+          zh-cn: 主容器
+          en-us: Main Container
+        description:
+          zh-cn: 主容器会被分配 GPU 资源
+          en-us: GPU resources are allocated to the main container.
+        $ref: '#/definitions/container'
+      sidecarContainers:
+        title:
+          zh-cn: 辅助容器
+          en-us: Sidecar Containers
+        description:
+          zh-cn: 可以添加多个辅助容器，辅助容器无法使用 GPU
+          en-us: |-
+            You can add multiple sidecars. Sidecars do not receive GPU
+            resources.
+        type: array
+        items:
+          $ref: '#/definitions/container'
+      prometheusScraper:
+        $ref: '#/definitions/prometheusScraper'
+      terminationGracePeriodSeconds:
+        title:
+          zh-cn: 优雅退出期限（s)
+          en-us: Termination Grace Period (s)
+        default: 30
+        type: integer
+        minimum: 1
+        multipleOf: 1
+      recommendInstanceTypes:
+        title:
+          zh-cn: 适配实例规格
+          en-us: Instance Types
+        description:
+          zh-cn: 选择已适配的实例规格；部署时优先匹配已选实例规格，部署时允许更改
+          en-us: |-
+            Select validated instance types. The scheduler will prioritize the
+            selected types during deployment.
+        default:
+          - nvidia.rtx4090.g1.amd64
+        type: array
+        minItems: 1
+        uniqueItems: true
+        items:
+          type: string
+          format: instance-type-selector
+  container:
+    type: object
+    required:
+      - name
+      - image
+    properties:
+      name:
+        title:
+          zh-cn: 容器名称
+          en-us: Container Name
+        description:
+          zh-cn: |-
+            - 只能使用小写字母、数字与连接符 -
+            - 必须以字母或数字开头和结尾
+            - 长度 1 ～ 32 个字符
+          en-us: |-
+            - Allowed: lowercase letters, digits, and hyphen (-)
+            - Must start and end with an alphanumeric character
+            - Length: 1--32 characters
+        type: string
+        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+      image:
+        title:
+          zh-cn: 镜像
+          en-us: Image
+        $ref: '#/definitions/image'
+      ports:
+        title:
+          zh-cn: 端口
+          en-us: Ports
+        type: array
+        default:
+          - containerPort: 80
+        items:
+          type: object
+          required:
+            - containerPort
+          properties:
+            containerPort:
+              title:
+                zh-cn: 端口号
+                en-us: Port Number
+              type: integer
+              maximum: 65535
+              minimum: 1
+              multipleOf: 1
+            portName:
+              title:
+                zh-cn: 端口名（可选）
+                en-us: Port Name (optional)
+              type: string
+      command:
+        type: array
+        title:
+          zh-cn: 启动命令
+          en-us: Command
+        description:
+          zh-cn: |-
+            > Docker 容器的 `Entrypoint` 
+            >
+            > K8s 的 `command`
+            >
+            > 换行时请注意添加必要的转义
+          en-us: |-
+            > Entrypoint of the Docker container
+            >
+            > Command of K8s
+        items:
+          type: string
+          default: ''
+          format: code-editor
+          language: shell
+      args:
+        type: array
+        title:
+          zh-cn: 启动参数
+          en-us: Args
+        description:
+          zh-cn: |-
+            > Docker 容器的 `CMD`
+            >
+            > K8s 的 `args`
+            >
+            > 换行时请注意添加必要的转义
+          en-us: |-
+            > CMD of the Docker container
+            >
+            > Args of K8s
+            >
+            > Note that line breaks require proper escaping
+        items:
+          type: string
+          default: ''
+          format: code-editor
+          language: shell
+      env:
+        type: array
+        title:
+          zh-cn: 环境变量
+          en-us: Environment Variables
+        description:
+          zh-cn: |-
+            > Docker 容器的 `Environment`
+            >
+            > K8s 的 `env`
+          en-us: |-
+            > Environment variables of the Docker container
+            >
+            > Env of K8s
+            >
+            > Note that line breaks require proper escaping
+        items:
+          type: object
+          required:
+            - name
+            - value
+          properties:
+            name:
+              title:
+                zh-cn: 环境变量 Key
+                en-us: Key
+              type: string
+            value:
+              title:
+                zh-cn: 变量值 Value
+                en-us: Value
+              type: string
+      filesVolumes:
+        type: array
+        title:
+          zh-cn: 挂载对象存储桶
+          en-us: Files Volumes
+        description:
+          zh-cn: |
+            > 以**只读**方式挂载【SiliconFlow 对象存储】中的存储桶（或指定 Prefix）到容器中
+            > 
+            > 系统提供缓存、加速服务
+            > 
+            > 可以在【对象存储】中将已有的 AWS S3 或阿里云 OSS 添加为存储桶
+          en-us: mount files bucket to container
+        items:
+          type: object
+          required:
+            - mountPath
+            - bucket
+          properties:
+            mountPath:
+              title:
+                zh-cn: 容器内挂载目录
+                en-us: Mount Path
+              description:
+                zh-cn: |
+                  > 挂载目录原有内容会被存储桶内容覆盖
+                en-us: |
+                  > Content in the mount path will be covered
+              type: string
+            bucket:
+              type: string
+              title: 挂载存储桶
+              format: files-bucket-selector
+            prefix:
+              type: string
+              title: 路径前缀
+              description:
+                zh-cn: |
+                  > 不需要开头和结尾的 `/`
+                  > 
+                  > 如：`aaa/bbb`
+                en-us: |
+                  > the `/` character at prefix and suffix is unnecessary
+              default: ''
+      sharedVolumes:
+        type: array
+        title:
+          zh-cn: 共享卷
+          en-us: Shared Volumes
+        description:
+          zh-cn: |-
+            > 主容器和辅助容器可以共同读写**同名**的共享卷
+            > 
+            > 不同容器可以分别指定容器内挂载目录
+          en-us: '> Shared volumes with the same name can be read and written by all containers that mount them within the same service. > > Different containers can choose different mount paths for the same shared volume.'
+        items:
+          type: object
+          required:
+            - mountPath
+            - name
+          properties:
+            mountPath:
+              title:
+                zh-cn: 容器内挂载目录
+                en-us: Mount Path
+              description:
+                zh-cn: |
+                  > 挂载目录原有内容会被共享卷内容覆盖
+                en-us: |
+                  > Content in the mount path will be covered
+              type: string
+            name:
+              title:
+                zh-cn: 共享卷名称
+                en-us: Shared Volume Name
+              type: string
+      imageVolumes:
+        type: array
+        title:
+          zh-cn: 挂载镜像卷
+          en-us: Image Volumes
+        description:
+          zh-cn: '> 将镜像以只读卷的方式挂在到容器指定目录，使容器可以访问镜像中的文件'
+          en-us: '> Mount an image as a read-only volume to a specific path inside the container.'
+        items:
+          type: object
+          required:
+            - mountPath
+            - image
+          properties:
+            mountPath:
+              title:
+                zh-cn: 容器内挂载目录
+                en-us: Mount Path
+              description:
+                zh-cn: |
+                  > 挂载目录原有内容会被镜像卷内容覆盖
+                en-us: |
+                  > Content in the mount path will be covered
+              type: string
+            image:
+              title:
+                zh-cn: 挂载镜像
+                en-us: Image to Mount
+              $ref: '#/definitions/image'
+      livenessProbe:
+        title:
+          zh-cn: 存活健康检查
+          en-us: Liveness Probe
+        type: object
+        properties:
+          set:
+            title:
+              zh-cn: 设置存活健康检查
+              en-us: Enable Liveness Probe
+            type: boolean
+            default: false
+        if:
+          required:
+            - set
+          properties:
+            set:
+              const: true
+        then:
+          $ref: '#/definitions/healthCheckProbe'
+      readinessProbe:
+        title:
+          zh-cn: 就绪健康检查
+          en-us: Readiness Probe
+        type: object
+        properties:
+          set:
+            title:
+              zh-cn: 设置就绪健康检查
+              en-us: Enable Readiness Probe
+            type: boolean
+            default: false
+        if:
+          required:
+            - set
+          properties:
+            set:
+              const: true
+        then:
+          $ref: '#/definitions/healthCheckProbe'
+      startupProbe:
+        title:
+          zh-cn: 启动健康检查
+          en-us: Startup Probe
+        type: object
+        properties:
+          set:
+            title:
+              zh-cn: 设置启动健康检查
+              en-us: Enable Startup Probe
+            type: boolean
+            default: false
+        if:
+          required:
+            - set
+          properties:
+            set:
+              const: true
+        then:
+          $ref: '#/definitions/healthCheckProbe'
+  image:
+    title:
+      zh-cn: 镜像
+      en-us: Image
+    type: string
+    format: image-digest-selector
+  healthCheckProbe:
+    type: object
+    required:
+      - httpGet
+    properties:
+      httpGet:
+        title:
+          zh-cn: Http Get 健康检查
+          en-us: Http Get Health Check
+        type: object
+        required:
+          - port
+          - path
+        properties:
+          path:
+            title:
+              zh-cn: Get 请求路径
+              en-us: HTTP Get Path
+            type: string
+          port:
+            title:
+              zh-cn: Get 请求端口
+              en-us: HTTP Get Port
+            type: integer
+            format: formdata-selector
+            script: |-
+              // console.log(options.id)
+              if (formdata && options && options.id) {
+                try {
+                  const idParts = options.id.split('_');
+                  let container = null; 
+                  let currentObject = formdata;
+                  for (let i = 1; i < idParts.length; i++) {
+                    const key = idParts[i];
+                    const nextObject = currentObject?.[key];
+
+                    if (nextObject && typeof nextObject === 'object') {
+                      currentObject = nextObject;
+                      if (currentObject.ports && Array.isArray(currentObject.ports)) {
+                        container = currentObject;
+                      }
+                    } else {
+                      break;
+                    }
+                  }
+                  const containerPorts = container?.ports || [];
+                  return containerPorts
+                    .filter(p => p && typeof p.containerPort === 'number')
+                    .map(p => ({
+                      label: String(p.containerPort) + (p.portName ? ` (${p.portName})` : ''),
+                      value: p.containerPort
+                    }));
+                } catch (e) {
+                  console.error('Error while computing dynamic options:', e);
+                  return [];
+                }
+              }
+              return [];
+      initialDelaySeconds:
+        title:
+          zh-cn: 首次检查时间（s）
+          en-us: Initial Delay (s)
+        default: 300
+        type: integer
+      periodSeconds:
+        title:
+          zh-cn: 检查间隔时间（s）
+          en-us: Period Seconds
+        default: 300
+        type: integer
+      timeoutSeconds:
+        title:
+          zh-cn: 超时等待时长（s）
+          en-us: Timeout (s)
+        default: 300
+        type: integer
+      failureThreshold:
+        title:
+          zh-cn: 最小连续成功次数
+          en-us: Minimum Consecutive Successes
+        default: 1
+        type: integer
+        minimum: 1
+        multipleOf: 1
+  prometheusScraper:
+    type: object
+    title:
+      zh-cn: Prometheus 指标采集配置
+      en-us: Prometheus Scraper
+    properties:
+      endpoints:
+        title:
+          zh-cn: 采集端点
+          en-us: Endpoints
+        type: array
+        items:
+          type: object
+          required:
+            - port
+            - path
+          properties:
+            port:
+              title:
+                zh-cn: 采集端口
+                en-us: Port
+              type: integer
+              format: formdata-selector
+              script: |-
+                if (formdata && options && options.id) {
+                  try {
+                    const idParts = options.id.split('_');
+                    let containerHolder = null;
+                    let currentObject = formdata;
+                    for (let i = 1; i < idParts.length; i++) {
+                      const key = idParts[i];
+                      const nextObject = currentObject?.[key];
+                      if (nextObject && typeof nextObject === 'object') {
+                        currentObject = nextObject;
+                        if (currentObject.hasOwnProperty('mainContainer')) {
+                          containerHolder = currentObject;
+                        }
+                      } else {
+                        break;
+                      }
+                    }
+                    if (!containerHolder) {
+                      console.error("无法在ID路径中找到任何包含 'mainContainer' 的对象:", options.id);
+                      return [];
+                    }
+                    let allPorts = [];
+                    if (containerHolder.mainContainer && containerHolder.mainContainer.ports) {
+                      allPorts = allPorts.concat(containerHolder.mainContainer.ports);
+                    }
+                    if (containerHolder.sidecarContainers && Array.isArray(containerHolder.sidecarContainers)) {
+                      containerHolder.sidecarContainers.forEach(sidecar => {
+                        if (sidecar && sidecar.ports) {
+                          allPorts = allPorts.concat(sidecar.ports);
+                        }
+                      });
+                    }
+                    return allPorts
+                      .filter(p => p && typeof p.containerPort === 'number')
+                      .map(p => ({
+                        label: String(p.containerPort) + (p.portName ? ` (${p.portName})` : ''),
+                        value: p.containerPort
+                      }));
+                  } catch (e) {
+                    console.error('计算动态选项时出错:', e);
+                    return [];
+                  }
+                }
+                return [];
+            path:
+              type: string
+              title:
+                zh-cn: 采集路径
+                en-us: Path
