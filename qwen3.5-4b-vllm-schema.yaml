@@ -5,7 +5,7 @@ entrypointService:
     pod:
       mainContainer:
         name: vllm
-        image: hub.6scloud.com/siliconflow/vllm/vllm-openai:qwen3_5
+        image: hub.6scloud.com/siliconflow/vllm/vllm-openai:nightly_20260227
         ports:
           - containerPort: 8000
             portName: http
@@ -75,9 +75,9 @@ entrypointService:
               --reasoning-parser qwen3 \
               --enable-auto-tool-choice \
               --tool-call-parser qwen3_coder \
-              --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}' \
-              --disable-log-requests &
-            VLLM_PID=$!
+              --quantization fp8 \
+              --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}' &
+              VLLM_PID=$!
 
 
             # 健康检查优化：更频繁检查，更快发现
@@ -215,7 +215,7 @@ entrypointService:
             wait "${VLLM_PID}"
         env:
           - name: VLLM_LOGGING_LEVEL
-            value: INFO
+            value: WARNING
           - name: VLLM_USE_MODELSCOPE
             value: 'True'
           - name: MODELSCOPE_CACHE

@@ -1,0 +1,288 @@
+{#- ---------- Utility: resolve service type with image validation ---------- -#}
+{%- macro resolve_service_type(service) %}
+{%- if not service %}
+{%- else %}
+{%- set explicit_type = service.serviceType if service.serviceType is defined and service.serviceType else None %}
+{%- set replica = service.replicaSet if service.replicaSet is defined else None %}
+{%- set lws = service.leaderWorkerSet if service.leaderWorkerSet is defined else None %}
+{%- set stateful = service.statefulSet if service.statefulSet is defined else None %}
+{%- set replica_has_image = replica
+   and replica.pod is defined and replica.pod
+   and replica.pod.mainContainer is defined and replica.pod.mainContainer
+   and replica.pod.mainContainer.image is defined and replica.pod.mainContainer.image %}
+{%- set leader_has_image = lws
+   and lws.leader is defined and lws.leader
+   and lws.leader.mainContainer is defined and lws.leader.mainContainer
+   and lws.leader.mainContainer.image is defined and lws.leader.mainContainer.image %}
+{%- set worker_has_image = lws
+   and lws.worker is defined and lws.worker
+   and lws.worker.mainContainer is defined and lws.worker.mainContainer
+   and lws.worker.mainContainer.image is defined and lws.worker.mainContainer.image %}
+{%- set lws_has_image = leader_has_image and worker_has_image %}
+{%- set stateful_has_image = stateful
+   and stateful.pod is defined and stateful.pod
+   and stateful.pod.mainContainer is defined and stateful.pod.mainContainer
+   and stateful.pod.mainContainer.image is defined and stateful.pod.mainContainer.image %}
+{%- if explicit_type == 'leaderWorkerSet' and lws_has_image %}
+leaderWorkerSet
+{%- elif explicit_type == 'statefulSet' and stateful_has_image %}
+statefulSet
+{%- elif explicit_type == 'replicaSet' and replica_has_image %}
+replicaSet
+{%- elif lws_has_image %}
+leaderWorkerSet
+{%- elif stateful_has_image %}
+statefulSet
+{%- elif replica_has_image %}
+replicaSet
+{%- endif %}
+{%- endif %}
+{%- endmacro %}
+
+{#- ---------- Probes ---------- -#}
+{%- macro render_probe(probe, probe_name, indent='        ') %}
+{%- if probe and probe.set %}
+{{ indent }}{{ probe_name }}:
+{{ indent }}  httpGet:
+{{ indent }}    path: {{ probe.httpGet.path }}
+{{ indent }}    port: {{ probe.httpGet.port }}
+{{ indent }}  initialDelaySeconds: {{ probe.initialDelaySeconds | default(0) }}
+{{ indent }}  periodSeconds: {{ probe.periodSeconds | default(10) }}
+{{ indent }}  timeoutSeconds: {{ probe.timeoutSeconds | default(1) }}
+{{ indent }}  failureThreshold: {{ probe.failureThreshold | default(3) }}
+{%- endif %}
+{%- endmacro %}
+
+{#- ---------- Unified container (object or list item) ---------- -#}
+{%- macro render_container_unified(container, indent='        ', as_list_item=False) %}
+{%- set base = indent ~ ('- ' if as_list_item else '') %}
+{%- set body_indent = indent ~ ('  ' if as_list_item else '') %}
+{{ base }}name: {{ container.name }}
+{{ body_indent }}image: {{ container.image }}
+{%- set ports = container.ports|default([]) %}
+{%- if ports %}
+{{ body_indent }}ports:
+{%- for port in ports %}
+{{ body_indent }}  - containerPort: {{ port.containerPort }}
+{%- if port.portName %}
+{{ body_indent }}    name: {{ port.portName }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- set commands = container.command|default([]) %}
+{%- if commands %}
+{{ body_indent }}command:
+{%- for cmd in commands %}
+{{ body_indent }}  - |-
+{%- for line in cmd.split('\n') %}
+{{ body_indent }}    {{ line }}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
+{%- set args = container.args|default([]) %}
+{%- if args %}
+{{ body_indent }}args:
+{%- for arg in args %}
+{{ body_indent }}  - |-
+{%- for line in arg.split('\n') %}
+{{ body_indent }}    {{ line }}
+{%- endfor %}
+{%- endfor %}
+{%- endif %}
+{%- set envs = container.env|default([]) %}
+{%- if envs %}
+{{ body_indent }}env:
+{%- for v in envs %}
+{{ body_indent }}  - name: {{ v.name }}
+{{ body_indent }}    value: {{ v.value|safe }}
+{%- endfor %}
+{%- endif %}
+{%- set filesVolumes = container.filesVolumes|default([]) %}
+{%- if filesVolumes %}
+{{ body_indent }}filesVolumes:
+{%- for filesVolume in filesVolumes %}
+{{ body_indent }}  - mountPath: {{ filesVolume.mountPath }}
+{{ body_indent }}    bucket: {{ filesVolume.bucket }}
+{% if filesVolume.prefix %}
+{{ body_indent }}    prefix: {{ filesVolume.prefix }}
+{% endif %}
+{%- endfor %}
+{%- endif %}
+{%- set sharedVolumes = container.sharedVolumes|default([]) %}
+{%- if sharedVolumes %}
+{{ body_indent }}sharedVolumes:
+{%- for sharedVolume in sharedVolumes %}
+{{ body_indent }}  - mountPath: {{ sharedVolume.mountPath }}
+{{ body_indent }}    name: {{ sharedVolume.name }}
+{%- endfor %}
+{%- endif %}
+{%- set imageVolumes = container.imageVolumes|default([]) %}
+{%- if imageVolumes %}
+{{ body_indent }}imageVolumes:
+{%- for imageVolume in imageVolumes %}
+{{ body_indent }}  - mountPath: {{ imageVolume.mountPath }}
+{{ body_indent }}    image: {{ imageVolume.image }}
+{%- endfor %}
+{%- endif %}
+{{- render_probe(container.livenessProbe, 'livenessProbe', body_indent) -}}
+{{- render_probe(container.readinessProbe, 'readinessProbe', body_indent) -}}
+{{- render_probe(container.startupProbe, 'startupProbe', body_indent) -}}
+{%- endmacro %}
+
+{#- ---------- Pod ---------- -#}
+{%- macro render_pod(pod, indent='      ') %}
+{%- set eps = pod.prometheusScraper.endpoints if pod.prometheusScraper and pod.prometheusScraper.endpoints is defined else [] %}
+{%- if eps %}
+{{ indent }}prometheusScraper:
+{{ indent }}  endpoints:
+{%- for endpoint in eps %}
+{{ indent }}    - port: {{ endpoint.port }}
+{{ indent }}      path: {{ endpoint.path }}
+{%- endfor %}
+{%- endif %}
+{{ indent }}terminationGracePeriodSeconds: {{ pod.terminationGracePeriodSeconds }}
+{%- set _recommend_types = pod.recommendInstanceTypes|default([]) %}
+{%- if _recommend_types %}
+{{ indent }}recommendInstanceTypes:
+{%- for recommendInstanceType in _recommend_types %}
+{{ indent }}  - {{ recommendInstanceType }}
+{%- endfor %}
+{%- else %}
+{{ indent }}recommendInstanceTypes: []
+{%- endif %}
+{{ indent }}mainContainer:
+{{- render_container_unified(pod.mainContainer, indent ~ '  ', False) -}}
+{%- set sidecars = pod.sidecarContainers|default([]) %}
+{%- if sidecars %}
+{{ indent }}sidecarContainers:
+{%- for sidecarContainer in sidecars %}
+{{- render_container_unified(sidecarContainer, indent ~ '  ', True) -}}
+{%- endfor %}
+{%- endif %}
+{%- endmacro %}
+
+{#- ---------- Autoscaler behavior (scaleUp/scaleDown) ---------- -#}
+{%- macro render_scale_behavior(scale_config, scale_type, default_stabilization, indent='') %}
+{%- if scale_config %}
+{{ indent }}{{ scale_type }}:
+{{ indent }}  stabilizationWindowSeconds: {{ scale_config.stabilizationWindowSeconds|default(default_stabilization) }}
+{%- set policies = scale_config.policies|default([]) %}
+{%- if policies %}
+{{ indent }}  policies:
+{%- for policy in policies %}
+{{ indent }}    - type: {{ policy.type }}
+{{ indent }}      value: {{ policy.value }}
+{{ indent }}      periodSeconds: {{ policy.periodSeconds }}
+{%- endfor %}
+{%- endif %}
+{%- endif %}
+{%- endmacro %}
+
+{#- ---------- Autoscaler ---------- -#}
+{%- macro render_auto_scaler(set, indent='    ') %}
+{%- if set and set.autoScaler %}
+{{ indent }}autoScaler:
+{%- set behavior = set.autoScaler.behavior if set.autoScaler.behavior is defined else None %}
+{%- set up = behavior.scaleUp if behavior and behavior.scaleUp is defined else None %}
+{%- set down = behavior.scaleDown if behavior and behavior.scaleDown is defined else None %}
+{%- if up or down %}
+{{ indent }}  behavior:
+{{- render_scale_behavior(up, 'scaleUp', 10, indent ~ '    ') -}}
+{{- render_scale_behavior(down, 'scaleDown', 300, indent ~ '    ') -}}
+{%- endif %}
+{%- set metrics = set.autoScaler.metrics|default([]) %}
+{%- if metrics %}
+{{ indent }}  metrics:
+{%- for m in metrics %}
+{{ indent }}    - type: {{ m.type }}
+{{ indent }}      metric:
+{{ indent }}        name: {{ m.metric.name }}
+{{ indent }}        target:
+{{ indent }}          value: {{ m.metric.target.value }}
+{{ indent }}          type: {{ m.metric.target.type }}
+{%- endfor %}
+{%- endif %}
+{%- endif %}
+{%- endmacro %}
+
+{#- ---------- Root document ---------- -#}
+gateway:
+  defaultConcurrencyLimit: {{ formdata.gateway.defaultConcurrencyLimit }}
+  entrypointPort: {{ formdata.gateway.entrypointPort }}
+{%- if formdata.gateway.workloadType != 'general' %}
+  workloadType: {{ formdata.gateway.workloadType }}
+{%- endif %}
+{%- set entry_service = formdata.entrypointService %}
+{%- set entry_type = resolve_service_type(entry_service)|trim %}
+{%- set entry_replica = entry_service.replicaSet if entry_service and entry_service.replicaSet is defined else None %}
+{%- set entry_lws = entry_service.leaderWorkerSet if entry_service and entry_service.leaderWorkerSet is defined else None %}
+{%- set entry_stateful = entry_service.statefulSet if entry_service and entry_service.statefulSet is defined else None %}
+entrypointService:
+  name: {{ entry_service.name }}
+{%- if entry_type == 'replicaSet' and entry_replica %}
+  replicaSet:
+{{- render_auto_scaler(entry_replica, '    ') }}
+    pod:
+{{- render_pod(entry_replica.pod, '      ') }}
+{%- elif entry_type == 'leaderWorkerSet' and entry_lws %}
+  leaderWorkerSet:
+    size: {{ entry_lws.size }}
+{%- set entry_expose_indices = entry_lws.exposeWorkerIndices|default([]) %}
+{%- if entry_expose_indices %}
+    exposeWorkerIndices:
+{%- for index in entry_expose_indices %}
+      - {{ index }}
+{%- endfor %}
+{%- else %}
+    exposeWorkerIndices: []
+{%- endif %}
+{{- render_auto_scaler(entry_lws, '    ') }}
+    leader:
+{{- render_pod(entry_lws.leader, '      ') }}
+    worker:
+{{- render_pod(entry_lws.worker, '      ') }}
+{%- elif entry_type == 'statefulSet' and entry_stateful %}
+  statefulSet:
+{{- render_auto_scaler(entry_stateful, '    ') }}
+    pod:
+{{- render_pod(entry_stateful.pod, '      ') }}
+{%- endif %}
+{%- set additionalServices = formdata.additionalServices|default([]) %}
+{%- if additionalServices %}
+additionalServices:
+{%- for additionalService in additionalServices %}
+  - name: {{ additionalService.name }}
+{%- set svc_type = resolve_service_type(additionalService)|trim %}
+{%- set svc_replica = additionalService.replicaSet if additionalService and additionalService.replicaSet is defined else None %}
+{%- set svc_lws = additionalService.leaderWorkerSet if additionalService and additionalService.leaderWorkerSet is defined else None %}
+{%- set svc_stateful = additionalService.statefulSet if additionalService and additionalService.statefulSet is defined else None %}
+{%- if svc_type == 'replicaSet' and svc_replica %}
+    replicaSet:
+{{- render_auto_scaler(svc_replica, '      ') }}
+      pod:
+{{- render_pod(svc_replica.pod, '        ') }}
+{%- elif svc_type == 'leaderWorkerSet' and svc_lws %}
+    leaderWorkerSet:
+      size: {{ svc_lws.size }}
+{%- set svc_expose_indices = svc_lws.exposeWorkerIndices|default([]) %}
+{%- if svc_expose_indices %}
+      exposeWorkerIndices:
+{%- for index in svc_expose_indices %}
+        - {{ index }}
+{%- endfor %}
+{%- else %}
+      exposeWorkerIndices: []
+{%- endif %}
+{{- render_auto_scaler(svc_lws, '      ') }}
+      leader:
+{{- render_pod(svc_lws.leader, '        ') }}
+      worker:
+{{- render_pod(svc_lws.worker, '        ') }}
+{%- elif svc_type == 'statefulSet' and svc_stateful %}
+    statefulSet:
+{{- render_auto_scaler(svc_stateful, '      ') }}
+      pod:
+{{- render_pod(svc_stateful.pod, '        ') }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}

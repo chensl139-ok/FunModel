@@ -1,0 +1,66 @@
+gateway:
+  defaultConcurrencyLimit: 1
+  entrypointPort: 8000
+
+entrypointService:
+  name: image-sync-task
+  replicaSet:
+    pod:
+      terminationGracePeriodSeconds: 30
+      recommendInstanceTypes:
+        - nvidia.rtx4090.g1.amd64
+      mainContainer:
+        name: image-sync
+        image: hub.6scloud.com/d1r7umcsfi9c73b4drdg/python:3.10-slim
+        ports:
+          - containerPort: 8000
+            name: http
+        command:
+          - |-
+            /bin/sh
+          - |-
+            -c
+        args:
+          - |-
+            set -e
+            apt-get update
+            apt-get install -y --no-install-recommends skopeo ca-certificates
+            rm -rf /var/lib/apt/lists/*
+            echo "[sync] $(date -Iseconds) start"
+
+            if [ "{{ formdata.image_architecture }}" = "all" ]; then
+              COPY_ARCH_ARGS="--all"
+            else
+              COPY_ARCH_ARGS="--override-os linux --override-arch {{ formdata.image_architecture }}"
+            fi
+
+            if [ -n "{{ formdata.source_creds_arg | default('') }}" ]; then
+              sh -c "skopeo copy ${COPY_ARCH_ARGS} {{ formdata.source_creds_arg | default('') }} --dest-creds \"{{ formdata.destination_username }}:{{ formdata.destination_password }}\" docker://{{ formdata.source_registry }}/{{ formdata.source_image }} docker://{{ formdata.destination_image }}"
+            else
+              sh -c "skopeo copy ${COPY_ARCH_ARGS} --dest-creds \"{{ formdata.destination_username }}:{{ formdata.destination_password }}\" docker://{{ formdata.source_registry }}/{{ formdata.source_image }} docker://{{ formdata.destination_image }}"
+            fi
+
+            echo "[sync] $(date -Iseconds) done"
+            echo "[sync] keep container alive to avoid replicaSet restart"
+            sleep infinity
+        env:
+          - name: SOURCE_REGISTRY
+            value: {{ formdata.source_registry }}
+          - name: SOURCE_IMAGE
+            value: {{ formdata.source_image }}
+          - name: IMAGE_ARCHITECTURE
+            value: {{ formdata.image_architecture }}
+          - name: SOURCE_CREDS_ARG
+            value: {{ formdata.source_creds_arg | default('') }}
+          - name: DESTINATION_IMAGE
+            value: {{ formdata.destination_image }}
+          - name: DESTINATION_USERNAME
+            value: {{ formdata.destination_username }}
+          - name: DESTINATION_PASSWORD
+            value: {{ formdata.destination_password }}
+        livenessProbe:
+          set: false
+        readinessProbe:
+          set: false
+        startupProbe:
+          set: false

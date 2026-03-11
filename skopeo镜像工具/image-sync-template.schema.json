@@ -1,0 +1,137 @@
+{
+  "description": {
+    "zh-cn": "用于生成单次执行的镜像同步任务配置。任务容器会安装 skopeo，并将源镜像复制到目标镜像仓库。",
+    "en-us": "Generate a single-run image sync job configuration. The task installs skopeo and copies a source image to a target registry."
+  },
+  "type": "object",
+  "required": [
+    "source_registry",
+    "source_image",
+    "image_architecture",
+    "destination_image",
+    "destination_username",
+    "destination_password"
+  ],
+  "properties": {
+    "source_registry": {
+      "title": {
+        "zh-cn": "源镜像仓库域名",
+        "en-us": "Source Registry"
+      },
+      "description": {
+        "zh-cn": "源镜像仓库域名，可填写加速源，例如 docker.m.daocloud.io。",
+        "en-us": "Source registry domain. You can use an acceleration mirror such as docker.m.daocloud.io."
+      },
+      "type": "string",
+      "default": "docker.m.daocloud.io",
+      "oneOf": [
+        {
+          "const": "docker.io",
+          "title": {
+            "zh-cn": "Docker Hub 官方源",
+            "en-us": "Docker Hub"
+          }
+        },
+        {
+          "const": "docker.m.daocloud.io",
+          "title": {
+            "zh-cn": "DaoCloud 加速源",
+            "en-us": "DaoCloud Mirror"
+          }
+        }
+      ]
+    },
+    "source_image": {
+      "title": {
+        "zh-cn": "源镜像路径",
+        "en-us": "Source Image"
+      },
+      "description": {
+        "zh-cn": "不包含 registry 的镜像路径和 tag，必须填写真实值，不能填写示例占位符。例如：vllm/vllm-omni:v0.16.0 或 nginx:perl",
+        "en-us": "Repository and tag without registry. Must be a real value, not a placeholder. Example: vllm/vllm-omni:v0.16.0 or nginx:perl"
+      },
+      "type": "string",
+      "pattern": "^[^{}\\s:]+(?:/[^{}\\s:]+)*:[^{}\\s]+$"
+    },
+    "image_architecture": {
+      "title": {
+        "zh-cn": "镜像架构",
+        "en-us": "Image Architecture"
+      },
+      "description": {
+        "zh-cn": "选择复制全部架构，或仅复制 amd64 / arm64 单一架构。",
+        "en-us": "Choose whether to copy all architectures or only amd64 / arm64."
+      },
+      "type": "string",
+      "default": "all",
+      "oneOf": [
+        {
+          "const": "all",
+          "title": {
+            "zh-cn": "全部架构",
+            "en-us": "All"
+          }
+        },
+        {
+          "const": "amd64",
+          "title": {
+            "zh-cn": "仅 amd64",
+            "en-us": "amd64"
+          }
+        },
+        {
+          "const": "arm64",
+          "title": {
+            "zh-cn": "仅 arm64",
+            "en-us": "arm64"
+          }
+        }
+      ]
+    },
+    "source_creds_arg": {
+      "title": {
+        "zh-cn": "源仓库认证参数",
+        "en-us": "Source Credentials Arg"
+      },
+      "description": {
+        "zh-cn": "可选。公开镜像可留空；私有镜像可填写类似 --src-creds 'user:password'。",
+        "en-us": "Optional. Leave empty for public images, or set something like --src-creds 'user:password' for private sources."
+      },
+      "type": "string"
+    },
+    "destination_image": {
+      "title": {
+        "zh-cn": "目标镜像路径",
+        "en-us": "Destination Image"
+      },
+      "description": {
+        "zh-cn": "目标镜像完整路径，不包含 docker:// 前缀，必须填写真实值，不能保留花括号示例。示例：hub.6scloud.com/d5ri54tsssvc73bles20/vllm-omni:v0.16.0",
+        "en-us": "Full destination image path without docker://. Must be a real value, not a brace placeholder. Example: hub.6scloud.com/d5ri54tsssvc73bles20/vllm-omni:v0.16.0"
+      },
+      "type": "string",
+      "pattern": "^hub\\.6scloud\\.com/[^{}\\s]+/[^{}\\s:]+:[^{}\\s]+$"
+    },
+    "destination_username": {
+      "title": {
+        "zh-cn": "目标仓库用户名",
+        "en-us": "Destination Username"
+      },
+      "description": {
+        "zh-cn": "目标镜像仓库登录用户名，例如 sfd4npgpdsssvc739907ng。",
+        "en-us": "Username for the destination registry, for example sfd4npgpdsssvc739907ng."
+      },
+      "type": "string"
+    },
+    "destination_password": {
+      "title": {
+        "zh-cn": "目标仓库密码",
+        "en-us": "Destination Password"
+      },
+      "description": {
+        "zh-cn": "目标镜像仓库登录密码。",
+        "en-us": "Password for the destination registry."
+      },
+      "type": "string"
+    }
+  }
+}

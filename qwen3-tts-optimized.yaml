@@ -1,0 +1,113 @@
+entrypointService:
+  name: qwen3-tts
+  serviceType: replicaSet
+  replicaSet:
+    pod:
+      mainContainer:
+        name: server
+        image: hub.6scloud.com/d5ri54tsssvc73bles20/vllm/vllm-omni:v0.16.0
+        ports:
+          - containerPort: 8091
+            portName: http
+        command:
+          - /bin/bash
+          - '-lc'
+        args:
+          - |
+            set -euo pipefail
+
+            echo ">>> Applying CUDA compat fix..."
+            rm -f /etc/ld.so.conf.d/*cuda-compat.conf || true
+            ldconfig || true
+
+            echo ">>> Using ModelScope as model source..."
+
+            MODEL_REF="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+            PORT="8091"
+
+            vllm-omni serve "${MODEL_REF}" \
+              --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+              --host 0.0.0.0 \
+              --port "${PORT}" \
+              --served-model-name "${MODEL_REF}" \
+              --trust-remote-code \
+              --enforce-eager \
+              --omni &
+            VLLM_PID=$!
+
+            echo ">>> Waiting for vLLM health..."
+            HEALTHY=false
+            for i in $(seq 1 300); do
+              if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+                echo ">>> vLLM is healthy (took ${i}s)"
+                HEALTHY=true
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$HEALTHY" != true ]; then
+              echo ">>> vLLM failed to start within 300s"
+              exit 1
+            fi
+
+            echo ">>> Running TTS warmup request..."
+            python3 <<'PYEOF' || true
+            import json
+            import time
+            import urllib.request
+
+            host = "127.0.0.1"
+            port = 8091
+            url = f"http://{host}:{port}/v1/audio/speech"
+            payload = {
+                "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                "input": "Warm up the text to speech model.",
+                "voice": "serena",
+                "response_format": "wav",
+            }
+
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+
+            for i in range(2):
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    _ = resp.read()
+                    print(f"Warmup {i+1}/2 OK via {url}: {resp.status}")
+                time.sleep(1)
+            PYEOF
+
+            wait "$VLLM_PID"
+        env:
+          - name: VLLM_USE_MODELSCOPE
+            value: 'True'
+        livenessProbe:
+          set: false
+        readinessProbe:
+          set: false
+        startupProbe:
+          set: false
+      terminationGracePeriodSeconds: 120
+      recommendInstanceTypes:
+        - nvidia.h200.g1.amd64
+    autoScaler:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 600
+      metrics:
+        - type: Function
+          metric:
+            name: Concurrency
+            target:
+              value: 4
+              type: Gauge
+gateway:
+  entrypointPort: 8091
+  defaultConcurrencyLimit: 8
+  workloadType: general
